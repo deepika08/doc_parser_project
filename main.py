@@ -6,27 +6,25 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from dotenv import load_dotenv
 import PyPDF2
 import docx
 
-# LangChain imports
 from langchain.chat_models import ChatOpenAI
-from langchain import LLMChain
 from langchain.prompts import PromptTemplate
+from langchain import LLMChain
 
-# ---- Logging ----
+# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---- Env ----
+# Load environment variables
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# ---- App + storage ----
-app = FastAPI(title="LangChain Compliance Agent (Fixed)")
+app = FastAPI(title="LangChain Compliance Agent with Modify Feature")
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
@@ -36,155 +34,149 @@ ALLOWED_TYPES = {
     "application/msword": ".doc"
 }
 
-# ---- Text extraction helpers ----
 def extract_text_from_pdf(file_path: Path) -> str:
     text = ""
-    with open(file_path, "rb") as f:
-        reader = PyPDF2.PdfReader(f)
-        for page in reader.pages:
-            text += (page.extract_text() or "") + "\n"
-    return text.strip()
+    try:
+        with open(file_path, "rb") as f:
+            reader = PyPDF2.PdfReader(f)
+            for page in reader.pages:
+                text += (page.extract_text() or "") + "\n"
+        return text.strip()
+    except Exception as e:
+        logger.exception("PDF extraction error")
+        raise
 
 def extract_text_from_docx(file_path: Path) -> str:
-    doc = docx.Document(file_path)
-    return "\n".join([p.text for p in doc.paragraphs if p.text]).strip()
-
-# ---- Helper: robust JSON extraction from model output ----
-def extract_json_from_text(s: str):
-    s = s.strip()
     try:
-        return json.loads(s)
-    except Exception:
-        # try to find first {...} block
-        start = s.find("{")
-        end = s.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            snippet = s[start:end+1]
-            try:
-                return json.loads(snippet)
-            except Exception:
-                pass
-    return None
+        document = docx.Document(file_path)
+        return "\n".join([p.text for p in document.paragraphs if p.text]).strip()
+    except Exception as e:
+        logger.exception("DOCX extraction error")
+        raise
 
-# ---- LangChain wrapper ----
-def analyze_with_langchain(text: str, guidelines: str) -> dict:
+def save_to_docx(text: str) -> Path:
+    filename = f"modified_{uuid.uuid4()}.docx"
+    output_path = UPLOAD_DIR / filename
+    try:
+        doc = docx.Document()
+        for line in text.split("\n"):
+            doc.add_paragraph(line)
+        doc.save(output_path)
+        return output_path
+    except Exception as e:
+        logger.exception("DOCX save error")
+        raise
+
+def analyze_and_modify(text: str, guidelines: str) -> dict:
     if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is not set in .env")
+        raise RuntimeError("Missing OPENAI_API_KEY in .env")
+    llm = ChatOpenAI(model_name="gpt-4o-mini", temperature=0, openai_api_key=OPENAI_API_KEY)
 
-    # short-circuit extremely long docs (you could instead chunk + aggregate)
-    text_snippet = text if len(text) < 6000 else text[:6000] + "\n\n[TRUNCATED]"
+    prompt = PromptTemplate(
+        input_variables=["guidelines", "text"],
+        template="""
+        You are an expert editor. Analyze the following DOCUMENT against the GUIDELINES
+        and rewrite it to be compliant. Return JSON with:
+        - report: Compliance summary and issues
+        - modified_text: Fully rewritten document text
 
-    # build a strict prompt that asks for JSON only
-    prompt_template = """You are an expert editor and compliance checker for English writing.
-Analyze the DOCUMENT (below) against the GUIDELINES (below) and RETURN A VALID JSON OBJECT ONLY (no explanation) with these keys:
-- summary: {{ "compliant": bool, "message": str }}
-- violations: [ {{ "rule": str, "message": str, "examples": [str] }} ... ]
-- suggestions: [str]
-- metrics: {{ "word_count": int, "sentence_count": int, "readability_note": str }}
+        GUIDELINES:
+        {guidelines}
 
-GUIDELINES:
-{guidelines}
-
-DOCUMENT:
-{text}
-"""
-    prompt = PromptTemplate(input_variables=["guidelines", "text"], template=prompt_template)
-
-    # instantiate ChatOpenAI via LangChain
-    llm = ChatOpenAI(model_name="gpt-4o-mini", temperature=0.0, openai_api_key=OPENAI_API_KEY)
-
+        DOCUMENT:
+        {text}
+        """
+    )
     chain = LLMChain(llm=llm, prompt=prompt)
 
-    # run. use predict (safe) and capture output
-    logger.info("Calling LLM for analysis (text length=%d)", len(text_snippet))
-    model_output = chain.predict(guidelines=guidelines, text=text_snippet)
-    logger.debug("Model raw output: %s", model_output[:1000])
-
-    parsed = extract_json_from_text(model_output)
-    if parsed is None:
-        # return raw for debugging but mark as non-compliant
+    try:
+        raw_response = chain.predict(guidelines=guidelines, text=text[:5000])
+        return json.loads(raw_response)
+    except json.JSONDecodeError:
+        logger.warning("Failed to parse JSON from LLM. Returning raw response.")
         return {
-            "summary": {"compliant": False, "message": "Model did not return parseable JSON"},
-            "violations": [],
-            "suggestions": [],
-            "metrics": {},
-            "raw_output": model_output
+            "report": {"summary": "Could not parse JSON", "raw_output": raw_response},
+            "modified_text": raw_response
         }
-    return parsed
+    except Exception:
+        logger.exception("LLM call failed")
+        raise
 
-# ---- UI & API endpoints ----
+
 @app.get("/", response_class=HTMLResponse)
 async def home():
+    """Simple home page with upload form."""
     return """
     <html>
-      <head><title>LangChain Compliance Checker</title></head>
-      <body>
-        <h2>Upload a document for compliance analysis</h2>
-        <a href="/upload-form">Upload form</a>
-      </body>
-    </html>
-    """
+      <head>
+        <title>Compliance Checker</title>
+      </head>
+      <body style="font-family: Arial; margin: 40px;">
+        <h1>Upload Document for Analysis & Modification</h1>
+        <form action="/process/" enctype="multipart/form-data" method="post">
+          <label for="file">Choose file:</label><br>
+          <input type="file" name="file" accept=".pdf,.doc,.docx" required><br><br>
 
-@app.get("/upload-form", response_class=HTMLResponse)
-async def upload_form():
-    return """
-    <html>
-      <head><title>Upload & Analyze</title></head>
-      <body>
-        <h2>Upload a PDF or Word Document</h2>
-        <form action="/analyze/" enctype="multipart/form-data" method="post">
-          <input type="file" name="file" accept=".pdf,.doc,.docx" required><br/><br/>
-          <label>Guidelines (plain text):</label><br/>
-          <textarea name="guidelines" rows="8" cols="80" placeholder="Avoid passive voice. Sentences under 25 words. Formal tone."></textarea><br/><br/>
-          <button type="submit">Analyze</button>
+          <label for="guidelines">Guidelines:</label><br>
+          <textarea name="guidelines" rows="5" cols="60"
+            placeholder="Enter writing guidelines here..." required></textarea><br><br>
+
+          <button type="submit">Upload & Process</button>
         </form>
       </body>
     </html>
     """
 
-@app.post("/analyze/")
-async def analyze_upload(
-    file: UploadFile = File(...),
-    guidelines: Optional[str] = Form(default="Avoid passive voice. Sentences under 25 words. Formal tone.")
-):
-    # validate mime
+@app.post("/process/")
+async def process_file(file: UploadFile = File(...), guidelines: str = Form(...)):
+    # Validate
     if file.content_type not in ALLOWED_TYPES:
         raise HTTPException(status_code=400, detail=f"Unsupported file type: {file.content_type}")
 
     ext = ALLOWED_TYPES[file.content_type]
-    fname = f"{uuid.uuid4()}{ext}"
-    fpath = UPLOAD_DIR / fname
+    filename = f"{uuid.uuid4()}{ext}"
+    file_path = UPLOAD_DIR / filename
 
-    # save file
+    # Save upload
     try:
-        with fpath.open("wb") as buffer:
+        with file_path.open("wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-    except Exception as e:
+    except Exception:
         logger.exception("File save error")
-        raise HTTPException(status_code=500, detail=f"File save error: {str(e)}")
+        raise HTTPException(status_code=500, detail="File save error")
 
-    # extract text
+    # Extract
     try:
-        if ext == ".pdf":
-            text = extract_text_from_pdf(fpath)
-        else:
-            text = extract_text_from_docx(fpath)
-    except Exception as e:
-        logger.exception("Extraction failed")
-        raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
+        text = extract_text_from_pdf(file_path) if ext == ".pdf" else extract_text_from_docx(file_path)
+        if not text.strip():
+            raise ValueError("No extractable text")
+    except Exception:
+        logger.exception("Text extraction failed")
+        raise HTTPException(status_code=500, detail="Text extraction failed")
 
-    if not text.strip():
-        raise HTTPException(status_code=422, detail="No extractable text found in the document.")
-
-    # analyze with LLM (LangChain)
+    # Analyze + rewrite
     try:
-        report = analyze_with_langchain(text, guidelines)
-    except Exception as e:
+        result = analyze_and_modify(text, guidelines)
+    except Exception:
         logger.exception("LLM analysis failed")
-        raise HTTPException(status_code=500, detail=f"LLM analysis failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="LLM analysis failed")
 
-    return JSONResponse(content={
-        "filename": fname,
-        "content_type": file.content_type,
-        "report": report
-    })
+    # Save rewritten
+    rewritten_text = result.get("modified_text", "")
+    try:
+        rewritten_file = save_to_docx(rewritten_text)
+    except Exception:
+        logger.exception("File save failed")
+        raise HTTPException(status_code=500, detail="Could not save rewritten file")
+
+    return {
+        "report": result.get("report", {}),
+        "download_link": f"/download/{rewritten_file.name}"
+    }
+
+@app.get("/download/{filename}")
+async def download_file(filename: str):
+    file_path = UPLOAD_DIR / filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(file_path, filename=filename)
